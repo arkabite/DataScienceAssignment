@@ -1,0 +1,225 @@
+Looking at your code against the README requirements, here's a breakdown of what's wrong and what you need to do:
+
+## Issues Found
+
+### 1. `agentic_data_scientist.py` — Major Gaps
+
+This is the most critical file you haven't touched much. The README explicitly says to enhance it with:
+
+**Missing: Robust Error Handling**
+```python
+# Current - no error handling around training
+results = train_models(df=df, ...)
+eval_payload = evaluate_best(results, ...)
+```
+Wrap key operations in try/except so the agent doesn't crash mid-run.
+
+**Missing: Retry Logic** — None exists at all.
+
+**Missing: Detailed Logging** — Only basic `print` statements.
+
+**Missing: Conditional Plan Step Execution** — This is the biggest gap. Your planner generates tasks like `"apply_smote"`, `"handle_severe_missing_data"`, `"cross_validation"`, `"feature_selection"`, `"increase_model_complexity"` etc., but the executor **completely ignores them**. The execution loop does the same thing regardless of the plan:
+
+```python
+# The executor always does the same 3 steps, plan is only
+# partially used inside modelling.py — not by the executor itself
+preprocessor = build_preprocessor(profile, plan)
+candidates = select_models(profile, plan, seed=self.ctx.seed)
+results = train_models(...)
+```
+
+Steps like `"apply_smote"`, `"cross_validation"`, `"feature_selection"`, `"dimensionality_reduction"` are planned but never actually run.
+
+---
+
+### 2. Plan Steps That Are Defined But Never Executed
+
+From your `planner.py`, these tasks are added to the plan but nothing in the pipeline acts on them:
+
+| Plan Task | Planned? | Executed? |
+|---|---|---|
+| `"apply_smote"` | ✅ | ❌ |
+| `"use_class_weights"` | ✅ | Partial (in `select_models`) |
+| `"handle_severe_missing_data"` | ✅ | ❌ |
+| `"impute_missing_values"` | ✅ | ❌ |
+| `"drop_constant_features"` | ✅ | ❌ |
+| `"apply_power_transform"` | ✅ | ❌ |
+| `"cross_validation"` | ✅ | ❌ |
+| `"feature_selection"` | ✅ | ❌ |
+| `"dimensionality_reduction"` | ✅ | ❌ |
+| `"increase_model_complexity"` | ✅ | ❌ |
+| `"feature_engineering"` | ✅ | ❌ |
+
+---
+
+### 3. `memory.py` — Too Basic
+
+The README says to add:
+- Similarity-based retrieval (not just exact fingerprint lookup)
+- Richer experience storage
+- Learning from past executions
+
+Currently it only stores/retrieves by exact fingerprint key with no intelligence.
+
+---
+
+### 4. Missing Entirely
+
+- ❌ No test files (need >60% coverage with `pytest`)
+- ❌ No `data/README.md` documenting your datasets
+- ❌ No `report/REPORT.md` technical report (3000–4000 words)
+- ❌ Only tested on one dataset (Wine Quality visible in `eda.ipynb`) — need **at least 3**
+
+---
+
+## What You Need to Do for `agentic_data_scientist.py`
+
+Here is a concrete example of what the enhanced executor should look like:
+
+```python
+def run(self, data_path, target, output_root="outputs", seed=42,
+        test_size=0.2, max_replans=1):
+
+    run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S") + "_" + str(uuid.uuid4())[:8]
+    output_dir = os.path.join(output_root, run_id)
+    os.makedirs(output_dir, exist_ok=True)
+
+    self.ctx = RunContext(
+        run_id=run_id, started_at=now_iso(), data_path=data_path,
+        target=target, output_dir=output_dir, seed=seed,
+        test_size=test_size, max_replans=max_replans,
+    )
+    self.state = {"replan_count": 0}
+
+    # --- Load data with error handling ---
+    try:
+        df = self.load_data(data_path)
+    except Exception as e:
+        self.log(f"FATAL: Could not load data — {e}")
+        raise
+
+    if target.strip().lower() == "auto":
+        inferred = infer_target_column(df)
+        if not inferred:
+            raise ValueError("Could not infer target column.")
+        self.ctx.target = inferred
+
+    profile = profile_dataset(df, self.ctx.target)
+    fp = dataset_fingerprint(df, self.ctx.target)
+    prev = self.memory.get_dataset_record(fp)
+    plan = create_plan(profile, memory_hint=prev)
+    self.log(f"Plan: {plan}")
+
+    while True:
+        # --- Execute plan steps conditionally ---
+        try:
+            df_processed = self._execute_plan_steps(df.copy(), plan, profile)
+            preprocessor = build_preprocessor(profile, plan)
+            candidates = select_models(profile, plan, seed=self.ctx.seed)
+            self.log(f"Candidates: {[n for n, _ in candidates]}")
+
+            # Retry logic for training
+            results = None
+            for attempt in range(3):
+                try:
+                    results = train_models(
+                        df=df_processed, target=self.ctx.target,
+                        preprocessor=preprocessor, candidates=candidates,
+                        seed=self.ctx.seed, test_size=self.ctx.test_size,
+                        output_dir=self.ctx.output_dir, verbose=self.verbose,
+                    )
+                    break
+                except Exception as e:
+                    self.log(f"Training attempt {attempt+1} failed: {e}")
+                    if attempt == 2:
+                        raise
+
+            eval_payload = evaluate_best(results, output_dir=self.ctx.output_dir)
+
+        except Exception as e:
+            self.log(f"ERROR during execution: {e}")
+            break
+
+        reflection = reflect(
+            dataset_profile=profile,
+            evaluation=eval_payload["best_metrics"],
+            all_metrics=eval_payload["all_metrics"],
+        )
+
+        # Save artifacts
+        save_json(os.path.join(self.ctx.output_dir, "eda_summary.json"), profile)
+        save_json(os.path.join(self.ctx.output_dir, "plan.json"), {"plan": plan})
+        save_json(os.path.join(self.ctx.output_dir, "metrics.json"), eval_payload)
+        save_json(os.path.join(self.ctx.output_dir, "reflection.json"), reflection)
+
+        write_markdown_report(
+            out_path=os.path.join(self.ctx.output_dir, "report.md"),
+            ctx=self.ctx, fingerprint=fp, dataset_profile=profile,
+            plan=plan, eval_payload=eval_payload, reflection=reflection,
+        )
+
+        self.memory.upsert_dataset_record(fp, {
+            "last_seen": now_iso(), "target": self.ctx.target,
+            "shape": profile["shape"],
+            "best_model": eval_payload["best_metrics"]["model"],
+            "best_metrics": eval_payload["best_metrics"],
+        })
+
+        if not should_replan(reflection):
+            break
+        if self.state["replan_count"] >= self.ctx.max_replans:
+            self.log("Max replans reached. Stopping.")
+            break
+
+        self.state["replan_count"] += 1
+        self.log(f"Replanning attempt #{self.state['replan_count']}...")
+        plan, profile = apply_replan_strategy(plan, profile, reflection)
+
+    self.log(f"Done. Outputs saved to: {self.ctx.output_dir}")
+    return self.ctx.output_dir
+
+
+def _execute_plan_steps(self, df, plan, profile):
+    """Conditionally execute preprocessing steps from the plan."""
+    target = self.ctx.target
+
+    if "drop_constant_features" in plan:
+        cols_to_drop = profile.get("constant_features", [])
+        df = df.drop(columns=[c for c in cols_to_drop if c in df.columns])
+        self.log(f"Dropped constant features: {cols_to_drop}")
+
+    if "handle_severe_missing_data" in plan or "impute_missing_values" in plan:
+        num_cols = profile["feature_types"]["numeric"]
+        for col in num_cols:
+            if col in df.columns and df[col].isnull().sum() > 0:
+                df[col] = df[col].fillna(df[col].median())
+        self.log("Imputed missing numeric values with median.")
+
+    if "apply_smote" in plan:
+        try:
+            from imblearn.over_sampling import SMOTE
+            X = df.drop(columns=[target])
+            y = df[target]
+            sm = SMOTE(random_state=self.ctx.seed)
+            X_res, y_res = sm.fit_resample(X, y)
+            df = pd.concat([X_res, y_res], axis=1)
+            self.log("Applied SMOTE oversampling.")
+        except ImportError:
+            self.log("WARNING: imbalanced-learn not installed. Skipping SMOTE.")
+
+    return df
+```
+
+---
+
+## Priority Action List
+
+| Priority | Task |
+|---|---|
+| 🔴 High | Add `_execute_plan_steps()` to `agentic_data_scientist.py` |
+| 🔴 High | Add try/except + retry logic in `agentic_data_scientist.py` |
+| 🔴 High | Test on 2 more datasets (minimum 3 total) |
+| 🔴 High | Write `report/REPORT.md` (3000–4000 words) |
+| 🟡 Medium | Add similarity-based retrieval to `memory.py` |
+| 🟡 Medium | Document datasets in `data/README.md` |
+| 🟡 Medium | Write tests in `tests/` (>60% coverage) |
